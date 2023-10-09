@@ -8,7 +8,9 @@ import urllib3
 import time
 import traceback
 
-from typing import Any
+
+from enum import Enum
+from typing import Any, Dict
 from datetime import datetime, timedelta, timezone
 import dateutil.parser
 
@@ -37,6 +39,58 @@ TACTICS = {
 SEVERITIES = ['Low', 'Medium', 'High', 'Critical']
 
 MAX_NUMBER_OF_ALERTS_PER_CALL = 25
+
+HFL_SECURITY_EVENT_INCOMING_ARGS = ['status']
+HFL_THREAT_INCOMING_ARGS = [
+    'status',
+    'security_event_count_by_level.critical',
+    'security_event_count_by_level.high',
+    'security_event_count_by_level.medium',
+    'security_event_count_by_level.low',
+    'mitre_tactics',
+    'agents.agent_hostname',
+    'last_seen',
+    'rules.rule_name',
+    'top_agents.agent_hostname',
+    'top_impacted_users.user_name',
+    'top_rules.rule_name',
+    'impacted_users.full_name',
+    'note.content'
+]
+
+SECURITY_EVENT_STATUS = {'new', 'probable_false_positive', 'false_positive', 'investigating', 'closed'}
+
+STATUS_HFL_TO_XSOAR = {
+    'new': 'New',
+    'probable_false_positive': 'Closed',
+    'false_positive': 'Closed',
+    'investigating': 'In Progress',
+    'closed': 'Closed'
+}
+
+STATUS_XSOAR_TO_HFL = {
+    'New': 'new',
+    'Reopened': 'investigating',
+    'In Progress': 'investigating',
+    'Closed': 'closed'
+}
+
+HFL_THREAT_OUTGOING_ARGS = {'status': f'Updated threat status, one of {"/".join(STATUS_HFL_TO_XSOAR.keys())}'}
+
+HFL_SECURITY_EVENT_OUTGOING_ARGS = {
+    'status': f'Updated security event status, one of {"/".join(STATUS_HFL_TO_XSOAR.keys())}'}
+
+MIRROR_DIRECTION_DICT = {
+    'None': None,
+    'Incoming': 'In',
+    'Outgoing': 'Out',
+    'Incoming And Outgoing': 'Both'
+}
+
+
+class IncidentType(Enum):
+    SEC_EVENT = 'sec'
+    THREAT = 'thr'
 
 
 def _construct_request_parameters(args: dict, keys: list, params={}):
@@ -88,6 +142,7 @@ class Client(BaseClient):
         if kwargs.get('method', None) == 'GET' and len(kwargs.get('params', {})) > 0:
             params = kwargs.pop('params')
             suffix = kwargs.pop('url_suffix')
+
             suffix += '?{}'.format('&'.join([f'{k}={v}'
                                    for (k, v) in params.items()]))
             kwargs['url_suffix'] = suffix
@@ -117,13 +172,38 @@ class Client(BaseClient):
             )
         return None
 
-    def endpoint_search(self, hostname=None, offset=0):
+    def api_call(self, api_method='GET', api_endpoint='/api/version', params={}, json_data={}):
 
-        data = assign_params(hostname=hostname, offset=offset)
+        return self._http_request(
+            method=api_method,
+            url_suffix=api_endpoint,
+            params=params,
+            json_data=json_data
+        )
+
+    def endpoint_search(self, hostname=None, offset=0, threat_id=None, fields=None):
+
+        fields_str = None
+        if fields:
+            fields_str = ','.join(fields)
+        data = assign_params(hostname=hostname, offset=offset, threat_id=threat_id, fields=fields_str, limit=10000)
 
         return self._http_request(
             method='GET',
             url_suffix='/api/data/endpoint/Agent/',
+            params=data
+        )
+
+    def user_search(self, threat_id=None, fields=None):
+
+        fields_str = None
+        if fields:
+            fields_str = ','.join(fields)
+        data = assign_params(offset=0, threat_id=threat_id, fields=fields_str, limit=10000)
+
+        return self._http_request(
+            method='GET',
+            url_suffix='/api/data/host_properties/local_users/windows/',
             params=data
         )
 
@@ -171,6 +251,8 @@ class Client(BaseClient):
                 }
             ]
         }
+
+        demisto.debug(str(data))
 
         return self._http_request(
             method='POST',
@@ -236,6 +318,10 @@ class Client(BaseClient):
             'binary': '/api/data/telemetry/Binary/',
             'network': '/api/data/telemetry/Network/',
             'eventlog': '/api/data/telemetry/FullEventLog/',
+            'dns': '/api/data/telemetry/DNSResolution/',
+            'windows_authentications': '/api/data/telemetry/authentication/AuthenticationWindows/',
+            'linux_authentications': '/api/data/telemetry/authentication/AuthenticationLinux/',
+            'macos_authentications': '/api/data/telemetry/authentication/AuthenticationMacos/'
         }
 
         kwargs = {
@@ -254,6 +340,73 @@ class Client(BaseClient):
             url_suffix=f'/api/data/endpoint/Agent/{agentid}/isolate/',
         )
 
+    def get_process_graph(self, process_uuid):
+        return self._http_request(
+            method='GET',
+            url_suffix=f'/api/data/telemetry/Processes/{process_uuid}/graph/',
+        )
+
+    def search_whitelist(self, keyword, provided_by_hlab):
+        return self._http_request(
+            method='GET',
+            url_suffix=f'/api/data/threat_intelligence/WhitelistRule/?'
+                       f'offset=0&limit=100&search={keyword}&'
+                       f'ordering=-last_update&provided_by_hlab={provided_by_hlab}',
+        )
+
+    def add_whitelist(self, comment, sigma_rule_id, target, field, case_insensitive, operator, value):
+
+        data = {
+            'comment': comment,
+            'sigma_rule_id': sigma_rule_id,
+            'target': target,
+            'criteria': [
+                {
+                    'case_insensitive': case_insensitive,
+                    'field': field,
+                    'operator': operator,
+                    'value': value
+                }
+            ]
+        }
+
+        return self._http_request(
+            method='POST',
+            url_suffix='/api/data/threat_intelligence/WhitelistRule/',
+            json_data=data
+        )
+
+    def add_criterion_to_whitelist(self, id, field, case_insensitive, operator, value):
+
+        data = self.get_whitelist(id)
+        data['criteria'].append({
+            'case_insensitive': case_insensitive,
+            'field': field,
+            'operator': operator,
+            'value': value
+        })
+
+        return self._http_request(
+            method='PUT',
+            url_suffix=f'/api/data/threat_intelligence/WhitelistRule/{id}/',
+            json_data=data
+        )
+
+    def get_whitelist(self, id):
+
+        return self._http_request(
+            method='GET',
+            url_suffix=f'/api/data/threat_intelligence/WhitelistRule/{id}/'
+        )
+
+    def delete_whitelist(self, id):
+
+        return self._http_request(
+            method='DELETE',
+            url_suffix=f'/api/data/threat_intelligence/WhitelistRule/{id}/',
+            return_empty_response=True
+        )
+
     def deisolate_endpoint(self, agentid):
         return self._http_request(
             method='POST',
@@ -268,19 +421,61 @@ class Client(BaseClient):
         else:
             data['ids'] = [eventid]
 
-        if status == 'New':
+        if status.lower() == 'new':
             data['new_status'] = 'new'
-        elif status == 'Investigating':
+        elif status.lower() == 'investigating':
             data['new_status'] = 'investigating'
-        elif status == 'False Positive':
+        elif status.lower() == 'false positive':
             data['new_status'] = 'false_positive'
-        elif status == 'Closed':
+        elif status.lower() == 'closed':
             data['new_status'] = 'closed'
 
         return self._http_request(
             method='POST',
             url_suffix='/api/data/alert/alert/Alert/tag/',
             json_data=data
+        )
+
+    def change_threat_status(self, threat_id, status):
+        data = {}  # type: Dict[str,Any]
+
+        if isinstance(threat_id, list):
+            data['id'] = threat_id
+        else:
+            data['id'] = [threat_id]
+
+        if status.lower() == 'new':
+            data['new_status'] = 'new'
+        elif status.lower() == 'investigating':
+            data['new_status'] = 'investigating'
+        elif status.lower() == 'false positive':
+            data['new_status'] = 'false_positive'
+        elif status.lower() == 'closed':
+            data['new_status'] = 'closed'
+
+        data['tag_security_events'] = True
+        data['update_by_query'] = True
+
+        return self._http_request(
+            method='PATCH',
+            url_suffix='/api/data/alert/alert/Threat/status/',
+            json_data=data
+        )
+
+    def update_threat_description(self, threat_id, content):
+
+        threat = self._http_request(
+            method='GET',
+            url_suffix=f'/api/data/alert/alert/Threat/{threat_id}/'
+        )
+
+        return self._http_request(
+            method='PATCH',
+            url_suffix=f'/api/data/alert/alert/Threat/{threat_id}/note/',
+            json_data={
+                'title': threat['slug'],
+                'content': content
+            }
         )
 
     def list_policies(self, policy_name=None):
@@ -322,7 +517,7 @@ class Client(BaseClient):
 
         return self._http_request(
             method='GET',
-            url_suffix='/api/data/threat_intelligence/IOCIndicator/',
+            url_suffix='/api/data/threat_intelligence/IOCRule/',
             params=data
         )
 
@@ -344,14 +539,14 @@ class Client(BaseClient):
 
         return self._http_request(
             method='POST',
-            url_suffix='/api/data/threat_intelligence/IOCIndicator/',
+            url_suffix='/api/data/threat_intelligence/IOCRule/',
             json_data=data
         )
 
     def delete_ioc(self, ioc_id):
         return self._http_request(
             method='DELETE',
-            url_suffix=f'/api/data/threat_intelligence/IOCIndicator/{ioc_id}/',
+            url_suffix=f'/api/data/threat_intelligence/IOCRule/{ioc_id}/',
             return_empty_response=True
         )
 
@@ -368,7 +563,6 @@ class Client(BaseClient):
 
 
 def assign_policy_to_agent(client, args):
-
     context = {}
     policy_name = args.get('policy', None)
 
@@ -384,45 +578,43 @@ def assign_policy_to_agent(client, args):
     else:
         context['Message'] = f'Unknown policy {policy_name}'
 
-    demisto.results({
-        'Type': entryTypes['note'],
-        'Contents': context,
-        'ContentsFormat': formats['json'],
-    })
+    return CommandResults(
+        readable_output=context['Message'],
+        outputs=context
+    )
 
 
 def test_module(client, args):
     result = client.test_api()
     if 'version' in result:
-        demisto.results('ok')
+        return 'ok'
     else:
-        demisto.results('failed to access version endpoint')
+        return 'nok'
 
 
 def fetch_incidents(client, args):
-
     last_run = demisto.getLastRun()
 
-    days = int(args['first_fetch']) if 'first_fetch' in args and args['first_fetch'] else 0
+    if not last_run:
+        last_run = [{}, {}]
+
+    if not isinstance(last_run, list):
+        last_run = [last_run, {}]
+
+    current_fetch_info_sec_events: dict = last_run[0]
+    current_fetch_info_threats: dict = last_run[1]
+
+    max_fetch = args.get('max_fetch', None)
+    fetch_types = args.get('fetch_types', [])
+
+    if 'first_fetch' in args and args['first_fetch']:
+        days = int(args['first_fetch'])
+    else:
+        days = 0
     first_fetch_time = int(datetime.timestamp(
-        datetime.now() - timedelta(days=days)) * 1000000)
+        datetime.utcnow() - timedelta(days=days)) * 1000000)
+
     alert_status = args.get('alert_status', None)
-    alert_type = args.get('alert_type', None)
-    min_severity = args.get('min_severity', SEVERITIES[0])
-    max_results = args.get('max_fetch', None)
-
-    severity = ','.join(SEVERITIES[SEVERITIES.index(min_severity):]).lower()
-
-    already_fetched_previous = []
-    already_fetched_current = []
-
-    last_fetch = None
-    if last_run:
-        last_fetch = last_run.get('last_fetch', None)
-        already_fetched_previous = last_run.get('already_fetched', [])
-
-    last_fetch = first_fetch_time if last_fetch is None else int(last_fetch)
-
     if alert_status == 'ACTIVE':
         status = ['new', 'probable_false_positive', 'investigating']
     elif alert_status == 'CLOSED':
@@ -430,90 +622,138 @@ def fetch_incidents(client, args):
     else:
         status = None
 
-    args = {
-        'ordering': '+alert_time',
-        'level': severity,
-        'limit': MAX_NUMBER_OF_ALERTS_PER_CALL,
-        'offset': 0
-    }  # type: Dict[str,Any]
+    incidents = []
 
-    if status:
-        args['status'] = ','.join(status)
+    if 'Threats' in fetch_types:
+        already_fetched_previous = []
+        already_fetched_current = []
 
-    if alert_type:
-        args['alert_type'] = alert_type
+        last_fetch = None
+        if current_fetch_info_threats:
+            last_fetch = current_fetch_info_threats.get('last_fetch', None)
+            already_fetched_previous = current_fetch_info_threats.get('already_fetched', [])
 
-    latest_created_time_us = 0
+        if last_fetch is None:
+            # if missing, use what provided via first_fetch_time
+            last_fetch = first_fetch_time
+        else:
+            # otherwise use the stored last fetch
+            last_fetch = int(last_fetch)
 
-    if last_fetch:
         latest_created_time_us = int(last_fetch)
         cursor = datetime.fromtimestamp(latest_created_time_us
                                         / 1000000).replace(tzinfo=timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-        args['alert_time__gte'] = cursor
 
-    incidents = []
-    total_number_of_alerts = 0
+        threats = get_threats(client,
+                              min_created_timestamp=cursor,
+                              threat_status=status,
+                              min_severity=args.get('min_severity', SEVERITIES[0])
+                              )
 
-    while True:
+        for threat in threats:
 
-        results = client._http_request(
-            method='GET',
-            url_suffix='/api/data/alert/alert/Alert/',
-            params=args
-        )
+            incident_created_time_us = int(datetime.timestamp(
+                dateutil.parser.isoparse(threat.get('first_seen', '0'))) * 1000000)
 
-        if 'count' in results and 'results' in results:
-            for alert in results['results']:
-                incident_created_time_us = int(datetime.timestamp(
-                    dateutil.parser.isoparse(alert.get('alert_time', '0'))) * 1000000)
+            # to prevent duplicates, we are only adding incidents with creation_time > last fetched incident
+            if incident_created_time_us <= latest_created_time_us:
+                continue
 
-                # to prevent duplicates, we are only adding incidents with creation_time > last fetched incident
-                if last_fetch and incident_created_time_us <= latest_created_time_us:
-                    continue
+            alert_id = threat.get('id', None)
+            threat['incident_link'] = f'{client._base_url}/threat/{alert_id}/summary'
 
-                tags = alert.get('tags', [])
-                tactic = []
-                technique_id = []
+            threat['mirror_direction'] = MIRROR_DIRECTION_DICT.get(args.get('mirror_direction'))
+            threat['mirror_instance'] = demisto.integrationInstance()
+            threat['mirror_tags'] = ['comments', 'work_notes']
+            threat['incident_type'] = 'Hurukai threat'
 
-                for tag in tags:
-                    if tag.startswith('attack'):
-                        content = tag[7:]
-                        if content in TACTICS:
-                            tactic.append(TACTICS[content])
-                        elif content[0] == 't':
-                            technique_id.append(content)
-
-                alert_id = alert.get('id', None)
-                alert['incident_link'] = f'{client._base_url}/security-event/{alert_id}/summary'
+            if alert_id not in already_fetched_previous:
                 incident = {
-                    'name': alert.get('rule_name', None),
-                    'occurred': alert.get('alert_time', None),
-                    'severity': SEVERITIES.index(alert.get('level', '').capitalize()) + 1,
-                    'rawJSON': json.dumps(alert)
+                    'name': threat.get('slug', None),
+                    'occurred': threat.get('first_seen', None),
+                    'severity': SEVERITIES.index(threat.get('level', '').capitalize()) + 1,
+                    'rawJSON': json.dumps(threat)
                 }
+                incidents.append(incident)
+                already_fetched_current.append(alert_id)
 
-                if alert_id not in already_fetched_previous:
-                    incidents.append(incident)
-                    already_fetched_current.append(alert_id)
+            if incident_created_time_us > latest_created_time_us:
+                latest_created_time_us = incident_created_time_us
 
-                if incident_created_time_us > latest_created_time_us:
-                    latest_created_time_us = incident_created_time_us
+            if max_fetch and len(incidents) >= max_fetch:
+                break
 
-                total_number_of_alerts += 1
-                if max_results and total_number_of_alerts >= max_results:
-                    break
+        current_fetch_info_threats = {'last_fetch': latest_created_time_us,
+                                      'already_fetched': already_fetched_current}
 
-        args['offset'] += len(results['results'])
-        if results['count'] == 0 or not results['next'] or (max_results and total_number_of_alerts >= max_results):
-            break
+    if 'Security Events' in fetch_types:
 
-    next_run = {'last_fetch': latest_created_time_us,
-                'already_fetched': already_fetched_current}
+        already_fetched_previous = []
+        already_fetched_current = []
 
-    demisto.setLastRun(next_run)
+        last_fetch = None
+        if current_fetch_info_sec_events:
+            last_fetch = current_fetch_info_sec_events.get('last_fetch', None)
+            already_fetched_previous = current_fetch_info_sec_events.get('already_fetched', [])
+
+        if last_fetch is None:
+            # if missing, use what provided via first_fetch_time
+            last_fetch = first_fetch_time
+        else:
+            # otherwise use the stored last fetch
+            last_fetch = int(last_fetch)
+
+        latest_created_time_us = int(last_fetch)
+        cursor = datetime.fromtimestamp(latest_created_time_us
+                                        / 1000000).replace(tzinfo=timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+        sec_events = get_security_events(client,
+                                         min_created_timestamp=cursor,
+                                         alert_status=status,
+                                         alert_type=args.get('alert_type'),
+                                         min_severity=args.get('min_severity', SEVERITIES[0])
+                                         )
+
+        for sec_event in sec_events:
+
+            incident_created_time_us = int(datetime.timestamp(
+                dateutil.parser.isoparse(sec_event.get('alert_time', '0'))) * 1000000)
+
+            # to prevent duplicates, we are only adding incidents with creation_time > last fetched incident
+            if incident_created_time_us <= latest_created_time_us:
+                continue
+
+            alert_id = sec_event.get('id', None)
+            sec_event['incident_link'] = f'{client._base_url}/security-event/{alert_id}/summary'
+
+            sec_event['mirror_direction'] = MIRROR_DIRECTION_DICT.get(args.get('mirror_direction'))
+            sec_event['mirror_instance'] = demisto.integrationInstance()
+            sec_event['incident_type'] = 'Hurukai alert'
+
+            if alert_id not in already_fetched_previous:
+                incident = {
+                    'name': sec_event.get('rule_name', None),
+                    'occurred': sec_event.get('alert_time', None),
+                    'severity': SEVERITIES.index(sec_event.get('level', '').capitalize()) + 1,
+                    'rawJSON': json.dumps(sec_event)
+                }
+                incidents.append(incident)
+                already_fetched_current.append(alert_id)
+
+            if incident_created_time_us > latest_created_time_us:
+                latest_created_time_us = incident_created_time_us
+
+            if max_fetch and len(incidents) >= max_fetch:
+                break
+
+        current_fetch_info_sec_events = {'last_fetch': latest_created_time_us,
+                                         'already_fetched': already_fetched_current}
+
+    last_run = [current_fetch_info_sec_events, current_fetch_info_threats]
+    demisto.setLastRun(last_run)
     demisto.incidents(incidents)
 
-    return next_run, incidents
+    return last_run, incidents
 
 
 def get_endpoint_info(client, args):
@@ -536,6 +776,30 @@ def get_endpoint_info(client, args):
     return agent
 
 
+def api_call(client, args):
+    api_method = args.get('api_method', 'GET').upper()
+    api_endpoint = args.get('api_endpoint', '/api/version')
+    params = args.get('parameters', None)
+    json_data = args.get('data')
+    if json_data:
+        json_data = json.loads(json_data)
+
+    parameters = {}
+    if params:
+        tokens = params.split('&')
+        for tok in tokens:
+            res = tok.split('=')
+            if len(res) == 2:
+                parameters[res[0]] = urllib.parse.quote_plus(res[1])
+
+    result = client.api_call(api_method, api_endpoint, parameters, json_data)
+
+    return CommandResults(
+        outputs_prefix='Harfanglab.API',
+        outputs=result
+    )
+
+
 def endpoint_search(client, args):
     hostname = args.get('hostname', None)
 
@@ -554,6 +818,51 @@ def endpoint_search(client, args):
         data
     )
     return data
+
+
+def get_frequent_users(client, args):
+    authentications = {}
+    output = []
+
+    limit = int(args.get('limit'))
+    del args['limit']
+
+    for class_name in ['TelemetryWindowsAuthentication', 'TelemetryLinuxAuthentication',
+                       'TelemetryMacosAuthentication']:
+
+        if class_name == 'TelemetryWindowsAuthentication':
+            args['logon_type'] = 2
+
+        klass = globals()[class_name]
+        instance = klass()
+
+        data = instance.get_telemetry(client, args)
+
+        if len(data['results']) > 0:
+            for authentication in data['results']:
+                username = authentication['target_username']
+                if username not in authentications:
+                    authentications[username] = 0
+                authentications[username] += 1
+
+            sorted_authentications = dict(sorted(authentications.items(), key=lambda item: item[1], reverse=True))
+
+            for username in sorted_authentications:
+                output.append({
+                    'Username': username,
+                    'Authentication attempts': sorted_authentications[username]
+                })
+                if limit and len(output) >= limit:
+                    break
+
+            readable_output = tableToMarkdown(f'Top {args.get("limit")} authentications', output, headers=[
+                'Username', 'Authentication attempts'], removeNull=True)
+
+            return CommandResults(
+                readable_output=readable_output,
+                outputs_prefix='Harfanglab.Authentications.Users',
+                outputs=output
+            )
 
 
 def job_create(client, args, parameters=None, can_use_previous_job=True):
@@ -580,7 +889,6 @@ def job_create(client, args, parameters=None, can_use_previous_job=True):
 
 
 def get_job_status(client, job_id):
-
     info = client.job_info(job_id)
 
     status = "running"
@@ -618,23 +926,15 @@ def job_info(client, args):
     for job_id in job_ids:
         context.append(get_job_status(client, job_id))
 
-    ec = {
-        'Harfanglab.Job.Info(val.ID && val.ID == obj.ID)': context,
-    }
     readable_output = tableToMarkdown('Jobs Info', context, headers=[
-                                      'ID', 'Status', 'Creation date'], removeNull=True)
+        'ID', 'Status', 'Creation date'], removeNull=True)
 
-    entry = {
-        'Type': entryTypes['note'],
-        'Contents': context,
-        'ContentsFormat': formats['json'],
-        'ReadableContentsFormat': formats['markdown'],
-        'HumanReadable': readable_output,
-        'EntryContext': ec
-    }
-
-    demisto.results(entry)
-    return context
+    return CommandResults(
+        readable_output=readable_output,
+        outputs_prefix='Harfanglab.Job.Info',
+        outputs_key_field='ID',
+        outputs=context
+    )
 
 
 def find_previous_job(client, action, agent_id):
@@ -666,19 +966,13 @@ def common_job(job_id, job_type):
         'Action': job_type
     }
 
-    ec = {
-        f'Harfanglab.Job(val.ID && val.ID == {job_id})': context,
-    }
+    return CommandResults(
+        readable_output=f'Job {job_id} started',
+        outputs_prefix='Harfanglab.Job',
+        outputs_key_field='ID',
+        outputs=context
 
-    demisto.results({
-        'Type': entryTypes['note'],
-        'Contents': context,
-        'ContentsFormat': formats['json'],
-        # 'ReadableContentsFormat': formats['markdown'],
-        # 'HumanReadable': readable_output,
-        'EntryContext': ec
-    })
-    return context
+    )
 
 
 def job_pipelist(client, args):
@@ -701,21 +995,12 @@ def result_pipelist(client, args):
     readable_output = tableToMarkdown(
         'Pipe List', pipes, headers=['name'], removeNull=True)
 
-    ec = {
-        'Harfanglab.Pipe(val.agent_id && val.agent_id === obj.agent_id)': {
-            'data': pipes,
-        }
-    }
-
-    demisto.results({
-        'Type': entryTypes['note'],
-        'Contents': pipes,
-        'ContentsFormat': formats['json'],
-        'ReadableContentsFormat': formats['markdown'],
-        'HumanReadable': readable_output,
-        'EntryContext': ec
-    })
-    return pipes
+    return CommandResults(
+        readable_output=readable_output,
+        outputs_prefix='Harfanglab.Pipe',
+        outputs_key_field='name',
+        outputs=pipes
+    )
 
 
 def job_prefetchlist(client, args):
@@ -745,28 +1030,24 @@ def result_prefetchlist(client, args):
         })
 
     readable_output = tableToMarkdown('Prefetch List', prefetchs, headers=[
-                                      'executable name', 'last executed'], removeNull=True)
+        'executable name', 'last executed'], removeNull=True)
 
-    ec = {
-        'Harfanglab.Prefetch(val.agent_id && val.agent_id === obj.agent_id)': {
-            'data': prefetchs,
-        }
-    }
-
-    demisto.results({
-        'Type': entryTypes['note'],
-        'Contents': prefetchs,
-        'ContentsFormat': formats['json'],
-        'ReadableContentsFormat': formats['markdown'],
-        'HumanReadable': readable_output,
-        'EntryContext': ec
-    })
-    return prefetchs
+    return CommandResults(
+        readable_output=readable_output,
+        outputs_prefix='Harfanglab.Prefetch',
+        outputs_key_field='name',
+        outputs=prefetchs
+    )
 
 
 def job_runkeylist(client, args):
     args['action'] = 'getHives'
-    ret, job_id = job_create(client, args)
+    parameters = {
+        'bSystemHives': True,
+        'bUsersHives': True,
+        'bWantSlowPlugins': False
+    }
+    ret, job_id = job_create(client, args, parameters)
 
     if not ret:
         return False
@@ -789,23 +1070,14 @@ def result_runkeylist(client, args):
         })
 
     readable_output = tableToMarkdown('RunKey List', output, headers=[
-                                      'name', 'fullpath', 'signed', 'md5'], removeNull=True)
+        'name', 'fullpath', 'signed', 'md5'], removeNull=True)
 
-    ec = {
-        'Harfanglab.RunKey(val.agent_id && val.agent_id === obj.agent_id)': {
-            'data': output,
-        }
-    }
-
-    demisto.results({
-        'Type': entryTypes['note'],
-        'Contents': output,
-        'ContentsFormat': formats['json'],
-        'ReadableContentsFormat': formats['markdown'],
-        'HumanReadable': readable_output,
-        'EntryContext': ec
-    })
-    return output
+    return CommandResults(
+        readable_output=readable_output,
+        outputs_prefix='Harfanglab.RunKey',
+        outputs_key_field='name',
+        outputs=output
+    )
 
 
 def job_scheduledtasklist(client, args):
@@ -833,23 +1105,14 @@ def result_scheduledtasklist(client, args):
         })
 
     readable_output = tableToMarkdown('Scheduled Task List', output, headers=[
-                                      'name', 'fullpath', 'signed', 'md5'], removeNull=True)
+        'name', 'fullpath', 'signed', 'md5'], removeNull=True)
 
-    ec = {
-        'Harfanglab.ScheduledTask(val.agent_id && val.agent_id === obj.agent_id)': {
-            'data': output,
-        }
-    }
-
-    demisto.results({
-        'Type': entryTypes['note'],
-        'Contents': output,
-        'ContentsFormat': formats['json'],
-        'ReadableContentsFormat': formats['markdown'],
-        'HumanReadable': readable_output,
-        'EntryContext': ec
-    })
-    return output
+    return CommandResults(
+        readable_output=readable_output,
+        outputs_prefix='Harfanglab.ScheduledTask',
+        outputs_key_field='name',
+        outputs=output
+    )
 
 
 def job_linux_persistence_list(client, args):
@@ -876,23 +1139,14 @@ def result_linux_persistence_list(client, args):
         })
 
     readable_output = tableToMarkdown('Linux persistence list', output, headers=[
-                                      'type', 'filename', 'fullpath'], removeNull=True)
+        'type', 'filename', 'fullpath'], removeNull=True)
 
-    ec = {
-        'Harfanglab.Persistence(val.agent_id && val.agent_id === obj.agent_id)': {
-            'data': output,
-        }
-    }
-
-    demisto.results({
-        'Type': entryTypes['note'],
-        'Contents': output,
-        'ContentsFormat': formats['json'],
-        'ReadableContentsFormat': formats['markdown'],
-        'HumanReadable': readable_output,
-        'EntryContext': ec
-    })
-    return output
+    return CommandResults(
+        readable_output=readable_output,
+        outputs_prefix='Harfanglab.Persistence',
+        outputs_key_field='filename',
+        outputs=output
+    )
 
 
 def job_driverlist(client, args):
@@ -919,28 +1173,24 @@ def result_driverlist(client, args):
         })
 
     readable_output = tableToMarkdown('Driver List', output, headers=[
-                                      'fullpath', 'signed', 'md5'], removeNull=True)
+        'fullpath', 'signed', 'md5'], removeNull=True)
 
-    ec = {
-        'Harfanglab.Driver(val.agent_id && val.agent_id === obj.agent_id)': {
-            'data': output,
-        }
-    }
-
-    demisto.results({
-        'Type': entryTypes['note'],
-        'Contents': output,
-        'ContentsFormat': formats['json'],
-        'ReadableContentsFormat': formats['markdown'],
-        'HumanReadable': readable_output,
-        'EntryContext': ec
-    })
-    return output
+    return CommandResults(
+        readable_output=readable_output,
+        outputs_prefix='Harfanglab.Driver',
+        outputs_key_field='md5',
+        outputs=output
+    )
 
 
 def job_servicelist(client, args):
     args['action'] = 'getHives'
-    ret, job_id = job_create(client, args)
+    parameters = {
+        'bSystemHives': True,
+        'bUsersHives': True,
+        'bWantSlowPlugins': False
+    }
+    ret, job_id = job_create(client, args, parameters)
 
     if not ret:
         return False
@@ -963,24 +1213,15 @@ def result_servicelist(client, args):
             'md5': x.get('binaryinfo', {}).get('binaryinfo', {}).get('md5'),
         })
 
-    readable_output = tableToMarkdown('Scheduled Task List', output, headers=[
-                                      'name', 'image_path', 'fullpath', 'signed', 'md5'], removeNull=True)
+    readable_output = tableToMarkdown('Service List', output, headers=[
+        'name', 'image_path', 'fullpath', 'signed', 'md5'], removeNull=True)
 
-    ec = {
-        'Harfanglab.Service(val.agent_id && val.agent_id === obj.agent_id)': {
-            'data': output,
-        }
-    }
-
-    demisto.results({
-        'Type': entryTypes['note'],
-        'Contents': output,
-        'ContentsFormat': formats['json'],
-        'ReadableContentsFormat': formats['markdown'],
-        'HumanReadable': readable_output,
-        'EntryContext': ec
-    })
-    return output
+    return CommandResults(
+        readable_output=readable_output,
+        outputs_prefix='Harfanglab.Service',
+        outputs_key_field='md5',
+        outputs=output
+    )
 
 
 def job_startuplist(client, args):
@@ -1002,34 +1243,25 @@ def result_startuplist(client, args):
     for x in data['results']:
         output.append({
             'startup_name': x['filename'],
-            'startup_fullpath': x['fullpathfilename'],
+            'startup_fullpath': x.get('fullpathfilename', x.get('fullpathname')),
             'fullpath': x.get('binaryinfo', {}).get('fullpath', ''),
             'signed': x.get('binaryinfo', {}).get('binaryinfo', {}).get('signed', False),
             'md5': x.get('binaryinfo', {}).get('binaryinfo', {}).get('md5'),
         })
 
     readable_output = tableToMarkdown('Startup List', output, headers=[
-                                      'startup_name',
-                                      'startup_fullpath',
-                                      'fullpath',
-                                      'signed',
-                                      'md5'], removeNull=True)
+        'startup_name',
+        'startup_fullpath',
+        'fullpath',
+        'signed',
+        'md5'], removeNull=True)
 
-    ec = {
-        'Harfanglab.Startup(val.agent_id && val.agent_id === obj.agent_id)': {
-            'data': output,
-        }
-    }
-
-    demisto.results({
-        'Type': entryTypes['note'],
-        'Contents': output,
-        'ContentsFormat': formats['json'],
-        'ReadableContentsFormat': formats['markdown'],
-        'HumanReadable': readable_output,
-        'EntryContext': ec
-    })
-    return output
+    return CommandResults(
+        readable_output=readable_output,
+        outputs_prefix='Harfanglab.Startup',
+        outputs_key_field='md5',
+        outputs=output
+    )
 
 
 def job_wmilist(client, args):
@@ -1058,32 +1290,27 @@ def result_wmilist(client, args):
         })
 
     readable_output = tableToMarkdown('WMI List', output, headers=[
-                                      'filter to consumer type',
-                                      'event filter name',
-                                      'event consumer name',
-                                      'event filter',
-                                      'consumer data'], removeNull=True)
+        'filter to consumer type',
+        'event filter name',
+        'event consumer name',
+        'event filter',
+        'consumer data'], removeNull=True)
 
-    ec = {
-        'Harfanglab.Wmi(val.agent_id && val.agent_id === obj.agent_id)': {
-            'data': output,
-        }
-    }
-
-    demisto.results({
-        'Type': entryTypes['note'],
-        'Contents': output,
-        'ContentsFormat': formats['json'],
-        'ReadableContentsFormat': formats['markdown'],
-        'HumanReadable': readable_output,
-        'EntryContext': ec
-    })
-    return output
+    return CommandResults(
+        readable_output=readable_output,
+        outputs_prefix='Harfanglab.Wmi',
+        outputs=output
+    )
 
 
 def job_processlist(client, args):
     args['action'] = 'getProcessList'
-    ret, job_id = job_create(client, args)
+    parameters = {
+        'getConnectionsList': False,
+        'getHandlesList': False,
+        'getSignaturesInfo': True
+    }
+    ret, job_id = job_create(client, args, parameters)
 
     if not ret:
         return False
@@ -1112,37 +1339,33 @@ def result_processlist(client, args):
         })
 
     readable_output = tableToMarkdown('Process List', output, headers=[
-                                      'name',
-                                      'session',
-                                      'username',
-                                      'integrity',
-                                      'pid',
-                                      'ppid',
-                                      'cmdline',
-                                      'fullpath',
-                                      'signed',
-                                      'md5'], removeNull=True)
+        'name',
+        'session',
+        'username',
+        'integrity',
+        'pid',
+        'ppid',
+        'cmdline',
+        'fullpath',
+        'signed',
+        'md5'], removeNull=True)
 
-    ec = {
-        'Harfanglab.Process(val.agent_id && val.agent_id === obj.agent_id)': {
-            'data': output,
-        }
-    }
-
-    demisto.results({
-        'Type': entryTypes['note'],
-        'Contents': output,
-        'ContentsFormat': formats['json'],
-        'ReadableContentsFormat': formats['markdown'],
-        'HumanReadable': readable_output,
-        'EntryContext': ec
-    })
-    return output
+    return CommandResults(
+        readable_output=readable_output,
+        outputs_prefix='Harfanglab.Process',
+        outputs_key_field='md5',
+        outputs=output
+    )
 
 
 def job_networkconnectionlist(client, args):
     args['action'] = 'getProcessList'
-    ret, job_id = job_create(client, args)
+    parameters = {
+        'getConnectionsList': True,
+        'getHandlesList': False,
+        'getSignaturesInfo': True
+    }
+    ret, job_id = job_create(client, args, parameters)
 
     if not ret:
         return False
@@ -1177,26 +1400,28 @@ def result_networkconnectionlist(client, args):
                     'md5': md5,
                 })
 
-    readable_output = tableToMarkdown('Network Connection List', output, headers=[
-        'state', 'protocol', 'version', 'src_addr', 'src_port', 'dst_addr', 'dst_port', 'fullpath', 'signed', 'md5'],
-        removeNull=True
+    readable_output = tableToMarkdown('Network Connection List',
+                                      output,
+                                      headers=[
+                                          'state',
+                                          'protocol',
+                                          'version',
+                                          'src_addr',
+                                          'src_port',
+                                          'dst_addr',
+                                          'dst_port',
+                                          'fullpath',
+                                          'signed',
+                                          'md5'],
+                                      removeNull=True
+                                      )
+
+    return CommandResults(
+        readable_output=readable_output,
+        outputs_prefix='Harfanglab.NetworkConnection',
+        outputs_key_field='md5',
+        outputs=output
     )
-
-    ec = {
-        'Harfanglab.NetworkConnection(val.agent_id && val.agent_id === obj.agent_id)': {
-            'data': output,
-        }
-    }
-
-    demisto.results({
-        'Type': entryTypes['note'],
-        'Contents': output,
-        'ContentsFormat': formats['json'],
-        'ReadableContentsFormat': formats['markdown'],
-        'HumanReadable': readable_output,
-        'EntryContext': ec
-    })
-    return output
 
 
 def job_networksharelist(client, args):
@@ -1227,25 +1452,26 @@ def result_networksharelist(client, args):
             'Hostname': x.get('agent', {}).get('hostname', '')
         })
 
-    readable_output = tableToMarkdown('Network Share List', output, headers=[
-        'Name', 'Caption', 'Description', 'Path', 'Status', 'Share type val', 'Share type', 'Hostname'], removeNull=True
+    readable_output = tableToMarkdown('Network Share List',
+                                      output,
+                                      headers=[
+                                          'Name',
+                                          'Caption',
+                                          'Description',
+                                          'Path',
+                                          'Status',
+                                          'Share type val',
+                                          'Share type',
+                                          'Hostname'],
+                                      removeNull=True
+                                      )
+
+    return CommandResults(
+        readable_output=readable_output,
+        outputs_prefix='Harfanglab.NetworkShare',
+        outputs_key_field='Name',
+        outputs=output
     )
-
-    ec = {
-        'Harfanglab.NetworkShare(val.agent_id && val.agent_id === obj.agent_id)': {
-            'data': output,
-        }
-    }
-
-    demisto.results({
-        'Type': entryTypes['note'],
-        'Contents': output,
-        'ContentsFormat': formats['json'],
-        'ReadableContentsFormat': formats['markdown'],
-        'HumanReadable': readable_output,
-        'EntryContext': ec
-    })
-    return output
 
 
 def job_sessionlist(client, args):
@@ -1274,25 +1500,25 @@ def result_sessionlist(client, args):
             'Hostname': x.get('agent', {}).get('hostname', '')
         })
 
-    readable_output = tableToMarkdown('Session List', output, headers=[
-        'Logon Id', 'Authentication package', 'Logon type', 'Logon type str', 'Session start time', 'Hostname'], removeNull=True
+    readable_output = tableToMarkdown('Session List',
+                                      output,
+                                      headers=[
+                                          'Logon Id',
+                                          'Authentication package',
+                                          'Logon type',
+                                          'Logon type str',
+                                          'Session start time',
+                                          'Hostname'
+                                      ],
+                                      removeNull=True
+                                      )
+
+    return CommandResults(
+        readable_output=readable_output,
+        outputs_prefix='Harfanglab.Session',
+        outputs_key_field='Logon Id',
+        outputs=output
     )
-
-    ec = {
-        'Harfanglab.Session(val.agent_id && val.agent_id === obj.agent_id)': {
-            'data': output,
-        }
-    }
-
-    demisto.results({
-        'Type': entryTypes['note'],
-        'Contents': output,
-        'ContentsFormat': formats['json'],
-        'ReadableContentsFormat': formats['markdown'],
-        'HumanReadable': readable_output,
-        'EntryContext': ec
-    })
-    return output
 
 
 def job_ioc(client, args):
@@ -1395,25 +1621,27 @@ def result_ioc(client, args):
             'registry_value': x.get('found_registry_value'),
         })
 
-    readable_output = tableToMarkdown('IOC Found List', output, headers=[
-        'type', 'search_value', 'fullpath', 'signed', 'md5', 'registry_path', 'registry_key', 'registry_value'], removeNull=True
+    readable_output = tableToMarkdown('IOC Found List',
+                                      output,
+                                      headers=[
+                                          'type',
+                                          'search_value',
+                                          'fullpath',
+                                          'signed',
+                                          'md5',
+                                          'registry_path',
+                                          'registry_key',
+                                          'registry_value'
+                                      ],
+                                      removeNull=True
+                                      )
+
+    return CommandResults(
+        readable_output=readable_output,
+        outputs_prefix='Harfanglab.IOC',
+        outputs_key_field='md5',
+        outputs=output
     )
-
-    ec = {
-        'Harfanglab.IOC(val.agent_id && val.agent_id === obj.agent_id)': {
-            'data': output,
-        }
-    }
-
-    demisto.results({
-        'Type': entryTypes['note'],
-        'Contents': output,
-        'ContentsFormat': formats['json'],
-        'ReadableContentsFormat': formats['markdown'],
-        'HumanReadable': readable_output,
-        'EntryContext': ec
-    })
-    return output
 
 
 def global_job_artifact(client, args, parameters, artifact_type):
@@ -1436,21 +1664,10 @@ def global_result_artifact(client, args, artifact_type):
     result = info
 
     if info['Status'] != 'finished':
-        ec = {
-            'Harfanglab.Artifact(val.agent_id && val.agent_id === obj.agent_id)': {
-                f'{artifact_type}': {},
-                'data': ''
-            }
-        }
-        demisto.results({
-            'Type': entryTypes['note'],
-            'Contents': {},
-            'ContentsFormat': formats['json'],
-            'ReadableContentsFormat': formats['markdown'],
-            'HumanReadable': 'Job results not available (Job status: {})'.format(info['Status']),
-            'EntryContext': ec
-        })
-        return result
+        return CommandResults(
+            readable_output=f'Job results not available (Job status: {info["Status"]})',
+            outputs_prefix='Harfanglab.Artifact'
+        )
 
     base_url = client._base_url
     data = client.job_data(job_id, 'artifact')
@@ -1476,25 +1693,13 @@ def global_result_artifact(client, args, artifact_type):
         })
 
     readable_output = tableToMarkdown(f'{artifact_type} download list', output, headers=[
-                                      'hostname', 'msg', 'size', 'download link'], removeNull=True)
+        'hostname', 'msg', 'size', 'download link'], removeNull=True)
 
-    ec = {
-        'Harfanglab.Artifact(val.agent_id && val.agent_id === obj.agent_id)': {
-            f'{artifact_type}': data['results'],
-            'data': data['results'][0]['download_link'] if len(data['results']) > 0 else ''
-        }
-    }
-
-    demisto.results({
-        'Type': entryTypes['note'],
-        'Contents': output,
-        'ContentsFormat': formats['json'],
-        'ReadableContentsFormat': formats['markdown'],
-        'HumanReadable': readable_output,
-        'EntryContext': ec
-    })
-    result['Results'] = output
-    return result
+    return CommandResults(
+        readable_output=readable_output,
+        outputs_prefix='Harfanglab.Artifact',
+        outputs=output
+    )
 
 
 def job_artifact_mft(client, args):
@@ -1598,24 +1803,13 @@ def result_artifact_downloadfile(client, args):
         })
 
     readable_output = tableToMarkdown('file download list', output, headers=[
-                                      'hostname', 'msg', 'size', 'download link'], removeNull=True)
+        'hostname', 'msg', 'size', 'download link'], removeNull=True)
 
-    ec = {
-        'Harfanglab.DownloadFile(val.agent_id && val.agent_id === obj.agent_id)': {
-            'data': output,
-        }
-    }
-
-    demisto.results({
-        'Type': entryTypes['note'],
-        'Contents': output,
-        'ContentsFormat': formats['json'],
-        'ReadableContentsFormat': formats['markdown'],
-        'HumanReadable': readable_output,
-        'EntryContext': ec
-    })
-
-    return data
+    return CommandResults(
+        readable_output=readable_output,
+        outputs_prefix='Harfanglab.DownloadFile',
+        outputs=output
+    )
 
 
 def job_artifact_ramdump(client, args):
@@ -1654,21 +1848,112 @@ def result_artifact_ramdump(client, args):
     readable_output = tableToMarkdown('Ramdump list', output, headers=['hostname', 'msg', 'size', 'download link'],
                                       removeNull=True)
 
-    ec = {
-        'Harfanglab.Ramdump(val.agent_id && val.agent_id === obj.agent_id)': {
-            'data': output,
-        }
-    }
+    return CommandResults(
+        readable_output=readable_output,
+        outputs_prefix='Harfanglab.Ramdump',
+        outputs=output
+    )
 
-    demisto.results({
-        'Type': entryTypes['note'],
-        'Contents': output,
-        'ContentsFormat': formats['json'],
-        'ReadableContentsFormat': formats['markdown'],
-        'HumanReadable': readable_output,
-        'EntryContext': ec
-    })
-    return output
+
+def get_process_graph(client, args):
+    process_uuid = args.get('process_uuid', None)
+
+    data = client.get_process_graph(process_uuid)
+
+    return CommandResults(
+        outputs_prefix='Harfanglab.ProcessGraph',
+        outputs_key_field='current_process_id',
+        outputs=data
+    )
+
+
+def search_whitelist(client, args):
+    keyword = args.get('keyword', None)
+    provided_by_hlab = args.get('provided_by_hlab', False)
+
+    data = client.search_whitelist(keyword, provided_by_hlab)
+
+    for wl in data['results']:
+        criteria = []
+        for c in wl['criteria']:
+            criteria.append(f'{c["field"]} {c["operator"]} {c["value"]}')
+        wl['criteria_str'] = ', '.join(criteria)
+
+    readable_output = tableToMarkdown(
+        f'Whitelists found for keyword: {keyword}',
+        data['results'],
+        headers=['comment', 'creation_date', 'last_update', 'target', 'criteria_str', 'sigma_rule_name'],
+        removeNull=True)
+
+    return CommandResults(
+        readable_output=readable_output,
+        outputs_prefix='Harfanglab.Whitelists',
+        outputs=data['results']
+    )
+
+
+def add_whitelist(client, args):
+    comment = args.get('comment', None)
+    sigma_rule_id = args.get('sigma_rule_id', "")
+    target = args.get('target', "all")
+    field = args.get('field', None)
+    case_insensitive = args.get('case_insensitive', True)
+    operator = args.get('operator', 'eq')
+    value = args.get('value', None)
+
+    message = None
+    data = None
+
+    if target not in ['all', 'sigma', 'yara', 'hlai', 'vt', 'ransom', 'orion', 'glimps', 'cape', 'driver']:
+        message = 'Invalid target. ' \
+                  'Target must be "all", "sigma", ' \
+                  '"yara", "hlai", "vt", "ransom", ' \
+                  '"orion", "glimps", "cape" or "driver"'
+    elif operator not in ['eq', 'regex', 'contains']:
+        message = 'Invalid operator. Operator must be "eq", "regex", or "contains"'
+    else:
+        data = client.add_whitelist(comment, sigma_rule_id, target, field, case_insensitive, operator, value)
+        message = 'Successfully added whitelist'
+
+    return CommandResults(
+        readable_output=message,
+        outputs_prefix='Harfanglab.Whitelists',
+        outputs=data
+    )
+
+
+def add_criterion_to_whitelist(client, args):
+    id = args.get('id', None)
+    field = args.get('field', None)
+    case_insensitive = args.get('case_insensitive', True)
+    operator = args.get('operator', 'eq')
+    value = args.get('value', None)
+
+    message = None
+    data = None
+
+    if operator not in ['eq', 'regex', 'contains']:
+        message = 'Invalid operator. Operator must be "eq", "regex", or "contains"'
+    else:
+
+        data = client.add_criterion_to_whitelist(id, field, case_insensitive, operator, value)
+        message = 'Successfully added criterion to whitelist'
+
+    return CommandResults(
+        readable_output=message,
+        outputs_prefix='Harfanglab.Whitelists',
+        outputs=data
+    )
+
+
+def delete_whitelist(client, args):
+    id = args.get('id', None)
+
+    client.delete_whitelist(id)
+
+    return CommandResults(
+        readable_output='Successfully deleted whitelist'
+    )
 
 
 def hunt_search_hash(client, args):
@@ -1690,8 +1975,7 @@ def hunt_search_hash(client, args):
 
         if len(data['data']) == 0:
             currently_running = str(curr_running) + " (0 are running)"
-            previously_executed = str(prev_runned) + \
-                " (0 were previously executed)"
+            previously_executed = str(prev_runned) + " (0 were previously executed)"
             prefetchs.append({
                 'process associated to hash currently running': currently_running,
                 'process associated to hash was previously executed': previously_executed
@@ -1739,7 +2023,7 @@ def hunt_search_hash(client, args):
 
         return_results(results)
 
-        return data
+        return outputs
 
 
 def hunt_search_running_process_hash(client, args):
@@ -1754,54 +2038,36 @@ def hunt_search_running_process_hash(client, args):
     else:
         data = client.invest_running_process(filehash=filehash)
         prefetchs = []
-        contextData = []
         for x in data['results']:
             prefetchs.append({
                 "Hostname": x['agent']['hostname'],
                 "Domain": x['agent'].get('domainname', ''),
                 "Username": x['username'],
-                "OS": x['agent']['osproducttype'] + " " + x['agent']['osversion'],
+                "OS": x['agent']['osproducttype'],
+                "OS Version": x['agent']['osversion'],
                 "Binary Path": x['binaryinfo']['fullpath'],
+                "Hash": filehash,
                 "Create timestamp": x['create_time'],
                 "Is maybe hollow": x['maybe_hollow']
             })
-            contextData.append({
-                'hash': filehash,
-                "hostname": x['agent']['hostname'],
-                "domain": x['agent'].get('domainname', ''),
-                "username": x['username'],
-                "os": x['agent']['osproducttype'],
-                "os_version": x['agent']['osversion'],
-                "path": x['binaryinfo']['fullpath'],
-                "create_time": x['create_time'],
-                "maybe_hollow": x['maybe_hollow'],
-                "binary_info": x['binaryinfo']['binaryinfo']
-            })
 
         readable_output = tableToMarkdown('War room overview', prefetchs, headers=[
-                                          "Hostname",
-                                          "Domain",
-                                          "Username",
-                                          "OS",
-                                          "Binary Path",
-                                          "Create timestamp",
-                                          "Is maybe hollow"], removeNull=True)
+            "Hostname",
+            "Domain",
+            "Username",
+            "OS",
+            "OS Version",
+            "Binary Path",
+            "Hash",
+            "Create timestamp",
+            "Is maybe hollow"], removeNull=True)
 
-        ec = {
-            'Harfanglab.HuntRunningProcessSearch(val.hash && val.hash === obj.hash)': {
-                'data': contextData,
-            }
-        }
-
-        demisto.results({
-            'Type': entryTypes['note'],
-            'Contents': prefetchs,
-            'ContentsFormat': formats['json'],
-            'ReadableContentsFormat': formats['markdown'],
-            'HumanReadable': readable_output,
-            'EntryContext': ec
-        })
-        return data
+        return CommandResults(
+            outputs_prefix='Harfanglab.HuntRunningProcessSearch',
+            outputs_key_field='hash',
+            outputs=prefetchs,
+            readable_output=readable_output
+        )
 
 
 def hunt_search_runned_process_hash(client, args):
@@ -1816,55 +2082,43 @@ def hunt_search_runned_process_hash(client, args):
     else:
         data = client.invest_runned_process(filehash=filehash)
         prefetchs = []
-        contextData = []
         for x in data['results']:
             prefetchs.append({
                 "Hostname": x['agent']['hostname'],
                 "Domain": x['agent'].get('domainname', ''),
                 "Username": x['username'],
-                "OS": x['agent']['osproducttype'] + " " + x['agent']['osversion'],
+                "OS": x['agent']['osproducttype'],
+                "OS Version": x['agent']['osversion'],
                 "Binary Path": x['image_name'],
+                "Hash": filehash,
                 "Create timestamp": x.get('pe_timestamp', '')
             })
-            contextData.append({
-                'hash': filehash,
-                "hostname": x['agent']['hostname'],
-                "domain": x['agent'].get('domainname', ''),
-                "username": x['username'],
-                "os": x['agent']['osproducttype'],
-                "os_version": x['agent']['osversion'],
-                "path": x['image_name'],
-                "create_time": x.get('pe_timestamp', ''),
-                "binary_info": x.get('pe_info', '')
-            })
 
-        readable_output = tableToMarkdown('War room overview', prefetchs, headers=[
-                                          "Hostname", "Domain", "Username", "OS", "Binary Path", "Create timestamp"],
+        readable_output = tableToMarkdown('War room overview',
+                                          prefetchs,
+                                          headers=[
+                                              "Hostname",
+                                              "Domain",
+                                              "Username",
+                                              "OS",
+                                              "Binary Path",
+                                              "Create timestamp"
+                                          ],
                                           removeNull=True)
 
-        ec = {
-            'Harfanglab.HuntRunnedProcessSearch(val.hash && val.hash === obj.hash)': {
-                'data': contextData,
-            }
-        }
-
-        demisto.results({
-            'Type': entryTypes['note'],
-            'Contents': prefetchs,
-            'ContentsFormat': formats['json'],
-            'ReadableContentsFormat': formats['markdown'],
-            'HumanReadable': readable_output,
-            'EntryContext': ec
-        })
-        return data
+        return CommandResults(
+            outputs_prefix='Harfanglab.HuntRunnedProcessSearch',
+            outputs_key_field='hash',
+            outputs=prefetchs,
+            readable_output=readable_output
+        )
 
 
-def isolate_endpoint(client, args) -> dict[str, Any]:
+def isolate_endpoint(client, args) -> CommandResults:
     agentid = args.get('agent_id', None)
     data = client.isolate_endpoint(agentid)
 
     context = {'Status': False, 'Message': ''}  # type: Dict[str,Any]
-    entryType = entryTypes['note']
 
     if agentid in data['requested']:
         context['Status'] = True
@@ -1873,18 +2127,15 @@ def isolate_endpoint(client, args) -> dict[str, Any]:
     if agentid in data['policy_not_allowed']:
         context['Status'] = False
         context['Message'] = 'Agent isolation request failed (not allowed by the agent policy)'
-        entryType = entryTypes['warning']
 
-    demisto.results({
-        'Type': entryType,
-        'Contents': context,
-        'ContentsFormat': formats['json'],
-    })
-
-    return context
+    return CommandResults(
+        outputs_prefix='Harfanglab.Isolation',
+        outputs=context,
+        readable_output=context['Message']
+    )
 
 
-def deisolate_endpoint(client, args) -> dict[str, Any]:
+def deisolate_endpoint(client, args) -> CommandResults:
     agentid = args.get('agent_id', None)
     data = client.deisolate_endpoint(agentid)
 
@@ -1894,16 +2145,14 @@ def deisolate_endpoint(client, args) -> dict[str, Any]:
         context['Status'] = True
         context['Message'] = 'Agent deisolation successfully requested'
 
-    demisto.results({
-        'Type': entryTypes['note'],
-        'Contents': context,
-        'ContentsFormat': formats['json'],
-    })
-
-    return context
+    return CommandResults(
+        outputs_prefix='Harfanglab.Unisolation',
+        outputs=context,
+        readable_output=context['Message']
+    )
 
 
-def change_security_event_status(client, args):
+def change_security_event_status(client, args) -> CommandResults:
     eventid = args.get('security_event_id', None)
     status = args.get('status', None)
 
@@ -1912,13 +2161,10 @@ def change_security_event_status(client, args):
     context = {}
     context['Message'] = f'Status for security event {eventid} changed to {status}'
 
-    demisto.results({
-        'Type': entryTypes['note'],
-        'Contents': context,
-        'ContentsFormat': formats['json'],
-    })
-
-    return context
+    return CommandResults(
+        outputs=context,
+        readable_output=context['Message']
+    )
 
 
 def add_ioc_to_source(client, args):
@@ -1944,15 +2190,13 @@ def add_ioc_to_source(client, args):
     else:
         client.add_ioc_to_source(
             ioc_value, ioc_type, ioc_comment, ioc_status, source_id)
-        context['Message'] = f'IOC {ioc_value} of type {ioc_type} added to source {source_name} with {ioc_status} status'
+        context[
+            'Message'] = f'IOC {ioc_value} of type {ioc_type} added to source {source_name} with {ioc_status} status'
 
-    demisto.results({
-        'Type': entryTypes['note'],
-        'Contents': context,
-        'ContentsFormat': formats['json'],
-    })
-
-    return context
+    return CommandResults(
+        outputs=context,
+        readable_output=context['Message']
+    )
 
 
 def delete_ioc_from_source(client, args):
@@ -1977,13 +2221,10 @@ def delete_ioc_from_source(client, args):
     else:
         context['Message'] = f'IOC {ioc_value} does not exist in source {source_name}'
 
-    demisto.results({
-        'Type': entryTypes['note'],
-        'Contents': context,
-        'ContentsFormat': formats['json'],
-    })
-
-    return context
+    return CommandResults(
+        outputs=context,
+        readable_output=context['Message']
+    )
 
 
 class Telemetry:
@@ -2020,12 +2261,16 @@ class Telemetry:
         # Global helper to construct output list
         return _construct_output(results, self.output_keys)
 
-    def telemetry(self, client, args):
+    def get_telemetry(self, client, args):
         self.params = _construct_request_parameters(
             args, self.keys, params=self.params)
 
         # Execute request with params
-        data = client.telemetry_data(self.telemetry_type, self.params)
+        return client.telemetry_data(self.telemetry_type, self.params)
+
+    def telemetry(self, client, args):
+
+        data = self.get_telemetry(client, args)
         output = self._construct_output(data['results'], client)
 
         # Determines headers for readable output
@@ -2034,21 +2279,11 @@ class Telemetry:
         readable_output = tableToMarkdown(
             self.title, output, headers=headers, removeNull=True)
 
-        ec = {
-            f'Harfanglab.Telemetry{self.telemetry_type}(val.agent_id && val.agent_id === obj.agent_id)': {
-                self.telemetry_type: output,
-            }
-        }
-
-        demisto.results({
-            'Type': entryTypes['note'],
-            'Contents': output,
-            'ContentsFormat': formats['json'],
-            'ReadableContentsFormat': formats['markdown'],
-            'HumanReadable': readable_output,
-            'EntryContext': ec
-        })
-        return output
+        return CommandResults(
+            outputs_prefix=f'Harfanglab.Telemetry{self.telemetry_type}',
+            outputs=output,
+            readable_output=readable_output
+        )
 
 
 class TelemetryProcesses(Telemetry):
@@ -2061,6 +2296,7 @@ class TelemetryProcesses(Telemetry):
             ('image_name', 'image_name'),
         ]
         self.output_keys = [
+            ('process_unique_id', 'process_unique_id'),
             ('create date', '@event_create_date'),
             ('hostname', ['agent', 'hostname']),
             ('process name', 'process_name'),
@@ -2082,6 +2318,132 @@ class TelemetryProcesses(Telemetry):
         binary_hash = args.get('hash', None)
         self._add_hash_parameters(binary_hash)
         return super().telemetry(client, args)
+
+
+class TelemetryDNSResolution(Telemetry):
+
+    def __init__(self):
+        super().__init__()
+
+        self.keys += [
+            ('requested_name', 'requested_name'),
+            ('query_type', 'query_type'),
+        ]
+        self.output_keys = [
+            ('create date', '@event_create_date'),
+            ('hostname', ['agent', 'hostname']),
+            ('agentid', ['agent', 'agentid']),
+            ('process image path', 'process_image_path'),
+            ('pid', 'pid'),
+            ('process unique id', 'process_unique_id'),
+            ('requested name', 'requested_name'),
+            ('query type', 'query_type'),
+            ('IP addresses', 'ip_addresses'),
+            ('tenant', 'tenant')
+        ]
+
+        self.title = 'DNS Resolutions'
+        self.telemetry_type = 'dns'
+
+    def telemetry(self, client, args):
+        return super().telemetry(client, args)
+
+
+class TelemetryWindowsAuthentication(Telemetry):
+
+    def __init__(self):
+        super().__init__()
+
+        self.keys += [
+            ('source_address', 'source_address'),
+            ('success', 'success'),
+            ('source_username', 'source_username'),
+            ('target_username', 'target_username'),
+            ('logon_title', 'windows.logon_title'),
+            ('logon_type', 'windows.logon_type'),
+        ]
+        self.output_keys = [
+            ('timestamp', '@timestamp'),
+            ('hostname', ['agent', 'hostname']),
+            ('agentid', ['agent', 'agentid']),
+            ('source address', 'source_address'),
+            ('source username', 'source_username'),
+            ('target username', 'target_username'),
+            ('success', 'success'),
+            ('event id', ['windows', 'event_id']),
+            ('event title', ['windows', 'event_title']),
+            ('logon process name', ['windows', 'logon_process_name']),
+            ('logon title', ['windows', 'logon_title']),
+            ('logon type', ['windows', 'logon_type']),
+            ('process name', 'process_name')
+        ]
+
+        self.title = 'Windows Authentications'
+        self.telemetry_type = 'windows_authentications'
+
+
+class TelemetryLinuxAuthentication(Telemetry):
+
+    def __init__(self):
+        super().__init__()
+
+        self.keys += [
+            ('source_address', 'source_address'),
+            ('success', 'success'),
+            ('source_username', 'source_username'),
+            ('target_username', 'target_username'),
+        ]
+        self.output_keys = [
+            ('timestamp', '@timestamp'),
+            ('hostname', ['agent', 'hostname']),
+            ('agentid', ['agent', 'agentid']),
+            ('source address', 'source_address'),
+            ('source username', 'source_username'),
+            ('target username', 'target_username'),
+            ('success', 'success'),
+            ('tty', ['linux', 'tty']),
+            ('target uid', ['linux', 'target_uid']),
+            ('target group', ['linux', 'target_group']),
+            ('target gid', ['linux', 'target_gid']),
+            ('process name', 'process_name'),
+            ('pid', 'pid')
+
+        ]
+
+        self.title = 'Linux Authentications'
+        self.telemetry_type = 'linux_authentications'
+
+
+class TelemetryMacosAuthentication(Telemetry):
+
+    def __init__(self):
+        super().__init__()
+
+        self.keys += [
+            ('source_address', 'source_address'),
+            ('success', 'success'),
+            ('source_username', 'source_username'),
+            ('target_username', 'target_username'),
+        ]
+        self.output_keys = [
+            ('timestamp', '@timestamp'),
+            ('hostname', ['agent', 'hostname']),
+            ('agentid', ['agent', 'agentid']),
+            ('source address', 'source_address'),
+            ('source username', 'source_username'),
+            ('target username', 'target_username'),
+            ('success', 'success'),
+            ('tty', ['linux', 'tty']),
+            ('target uid', ['linux', 'target_uid']),
+            ('target group', ['linux', 'target_group']),
+            ('target gid', ['linux', 'target_gid']),
+            ('process name', 'process_name'),
+            ('pid', 'pid')
+
+        ]
+
+        self.title = 'Macos Authentications'
+        self.telemetry_type = 'macos_authentications'
 
 
 class TelemetryNetwork(Telemetry):
@@ -2272,6 +2634,12 @@ def get_function_from_command_name(command):
         'harfanglab-telemetry-network': TelemetryNetwork().telemetry,
         'harfanglab-telemetry-eventlog': TelemetryEventLog().telemetry,
         'harfanglab-telemetry-binary': TelemetryBinary().telemetry,
+        'harfanglab-telemetry-dns': TelemetryDNSResolution().telemetry,
+        'harfanglab-telemetry-authentication-windows': TelemetryWindowsAuthentication().telemetry,
+        'harfanglab-telemetry-authentication-linux': TelemetryLinuxAuthentication().telemetry,
+        'harfanglab-telemetry-authentication-macos': TelemetryMacosAuthentication().telemetry,
+        'harfanglab-telemetry-authentication-users': get_frequent_users,
+        'harfanglab-telemetry-process-graph': get_process_graph,
 
         'harfanglab-hunt-search-hash': hunt_search_hash,
         'harfanglab-hunt-search-running-process-hash': hunt_search_running_process_hash,
@@ -2286,11 +2654,600 @@ def get_function_from_command_name(command):
         'harfanglab-add-ioc-to-source': add_ioc_to_source,
         'harfanglab-delete-ioc-from-source': delete_ioc_from_source,
 
+        'harfanglab-whitelist-search': search_whitelist,
+        'harfanglab-whitelist-add': add_whitelist,
+        'harfanglab-whitelist-add-criterion': add_criterion_to_whitelist,
+        'harfanglab-whitelist-delete': delete_whitelist,
+
+        'harfanglab-api-call': api_call,
+
         'fetch-incidents': fetch_incidents,
+        'get-modified-remote-data': get_modified_remote_data,
+        'get-remote-data': get_remote_data,
+        'update-remote-system': update_remote_system,
+        'get-mapping-fields': get_mapping_fields,
         'test-module': test_module
     }
 
     return commands.get(command)
+
+
+def get_security_events(client, security_event_ids=None, min_created_timestamp=None, min_updated_timestamp=None,
+                        alert_status=None, alert_type=None, min_severity=SEVERITIES[0], max_fetch=None, fields=None,
+                        limit=MAX_NUMBER_OF_ALERTS_PER_CALL, ordering='alert_time', threat_id=None):
+    security_events = []
+
+    agents: Dict[str, Any] = {}
+
+    if security_event_ids:
+        for sec_evt_id in security_event_ids:
+            results = client._http_request(
+                method='GET',
+                url_suffix=f'/api/data/alert/alert/Alert/{sec_evt_id}/details/'
+            )
+
+            alert = results['alert']
+
+            # Retrieve additional endpoint information
+            groups = []
+            agent = None
+            agentid = alert.get('agent', {}).get('agentid', None)
+            if agentid:
+                if agentid in agents:
+                    agent = agents[agentid]
+                else:
+                    try:
+                        agent = client.get_endpoint_info(agentid)
+                    except Exception:
+                        agent = None
+                    agents[agentid] = agent
+
+                if agent:
+                    for g in agent.get('groups', []):
+                        groups.append(g['name'])
+                    alert['agent']['policy_name'] = agent.get('policy', {}).get('name')
+                    alert['agent']['groups'] = groups
+
+            security_events.append(alert)
+
+        return security_events
+
+    args = {
+        'ordering': ordering,
+        'level': ','.join(SEVERITIES[SEVERITIES.index(min_severity):]).lower(),
+        'limit': limit,
+        'offset': 0
+    }  # type: Dict[str,Any]
+
+    if alert_status == 'ACTIVE':
+        args['status'] = ','.join(['new', 'probable_false_positive', 'investigating'])
+    elif alert_status == 'CLOSED':
+        args['status'] = ','.join(['closed', 'false_positive'])
+
+    if alert_type:
+        args['alert_type'] = alert_type
+
+    if min_created_timestamp:
+        args['alert_time__gte'] = min_created_timestamp
+
+    if min_updated_timestamp:
+        if not fields:
+            fields = []
+        if 'last_update' not in fields:
+            fields.append('last_update')
+
+    if fields:
+        args['fields'] = ','.join(fields)
+
+    if threat_id:
+        args['threat_key'] = threat_id
+
+    if min_updated_timestamp:
+        args['last_update__gte'] = min_updated_timestamp
+
+    demisto.debug(f'Args for fetch_security_events: {args}')
+
+    while True:
+
+        results = client._http_request(
+            method='GET',
+            url_suffix='/api/data/alert/alert/Alert/',
+            params=args
+        )
+
+        demisto.debug(f'Got {len(results["results"])} security events')
+
+        for alert in results['results']:
+
+            alert_id = alert.get('id', None)
+            alert['incident_link'] = f'{client._base_url}/security-event/{alert_id}/summary'
+
+            # Retrieve additional endpoint information
+            groups = []
+            agent = None
+            agentid = alert.get('agent', {}).get('agentid', None)
+            if agentid:
+                if agentid in agents:
+                    agent = agents[agentid]
+                else:
+                    try:
+                        agent = client.get_endpoint_info(agentid)
+                    except Exception:
+                        agent = None
+                    agents[agentid] = agent
+
+                if agent:
+                    for g in agent.get('groups', []):
+                        groups.append(g['name'])
+                    alert['agent']['policy_name'] = agent.get('policy', {}).get('name')
+                    alert['agent']['groups'] = groups
+
+            security_events.append(alert)
+
+            if max_fetch and len(security_events) >= max_fetch:
+                break
+
+        demisto.debug(f'Got eventually {len(security_events)} security events')
+
+        args['offset'] += len(results['results'])
+        if results['count'] == 0 or not results['next'] or (max_fetch and len(security_events) >= max_fetch):
+            break
+
+    return security_events
+
+
+def enrich_threat(client, threat):
+    if not client or not threat or 'id' not in threat:
+        return
+
+    threat_id = threat.get('id')
+
+    if not threat_id:
+        return
+
+    # Get agents
+    results = client.endpoint_search(threat_id=threat_id,
+                                     fields=['id', 'hostname', 'domainname', 'osproducttype', 'ostype'])
+    threat['agents'] = results['results']
+
+    # Get users
+    results = client.user_search(threat_id=threat_id)
+    threat['impacted_users'] = results['results']
+
+    # Get rules
+    args = assign_params(threat_id=threat_id, fields='rule_level,rule_name,security_event_count')
+    results = client._http_request(
+        method='GET',
+        url_suffix='/api/data/alert/alert/Threat/rules/',
+        params=args
+    )
+    threat['rules'] = results['results']
+
+
+def get_threats(client, threat_ids=None, min_created_timestamp=None, min_updated_timestamp=None, threat_status=None,
+                min_severity=SEVERITIES[0], max_fetch=None, fields=None, limit=MAX_NUMBER_OF_ALERTS_PER_CALL,
+                ordering='last_seen'):
+    threats = []
+
+    if not threat_ids:
+        threat_ids = []
+        args = {
+            'ordering': ordering,
+            'level': ','.join(SEVERITIES[SEVERITIES.index(min_severity):]).lower(),
+            'limit': limit,
+            'offset': 0
+        }  # type: Dict[str,Any]
+
+        if threat_status == 'ACTIVE':
+            args['status'] = ','.join(['new', 'investigating'])
+        elif threat_status == 'CLOSED':
+            args['status'] = ','.join(['closed', 'false_positive'])
+
+        if min_created_timestamp:
+            args['from'] = min_created_timestamp
+
+        if min_updated_timestamp:
+            args['last_update__gte'] = min_updated_timestamp
+
+        args['fields'] = 'id'
+
+        demisto.debug(f'Args for get_threats: {args}')
+
+        while True:
+            results = client._http_request(
+                method='GET',
+                url_suffix='/api/data/alert/alert/Threat/',
+                params=args
+            )
+            demisto.debug(f'Got {len(results["results"])} threats')
+
+            for threat in results['results']:
+                threat_ids.append(threat['id'])
+
+                if max_fetch and len(threat_ids) >= max_fetch:
+                    break
+
+            args['offset'] += len(results['results'])
+            if results['count'] == 0 or not results['next'] or (max_fetch and len(threat_ids) >= max_fetch):
+                break
+
+    for threat_id in threat_ids:
+        threat = client._http_request(
+            method='GET',
+            url_suffix=f'/api/data/alert/alert/Threat/{threat_id}/'
+        )
+        enrich_threat(client, threat)
+
+        threat_id = threat.get('id', None)
+        threat['incident_link'] = f'{client._base_url}/threat/{threat_id}/summary'
+
+        threats.append(threat)
+
+    return threats
+
+
+def get_modified_remote_data(client, args):
+    """
+    Gets the modified remote security events and threat IDs.
+    Args:
+        args:
+            last_update: the last time we retrieved modified security events and threats.
+
+    Returns:
+        GetModifiedRemoteDataResponse object, which contains a list of the retrieved security events and threat IDs.
+    """
+    demisto.debug('In get_modified_remote_data')
+    remote_args = GetModifiedRemoteDataArgs(args)
+
+    last_update_utc = dateparser.parse(remote_args.last_update, settings={'TIMEZONE': 'UTC'})  # convert to utc format
+    assert last_update_utc is not None, f"could not parse{remote_args.last_update}"
+    last_update_timestamp = last_update_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+    demisto.debug(f'Remote arguments last_update in UTC is {last_update_timestamp}')
+
+    modified_ids_to_mirror = list()
+
+    # Fetch the latest security events and retrieve those whose last update fields is more recent than the last update timestamp
+    sec_events = get_security_events(client,
+                                     min_updated_timestamp=last_update_timestamp,
+                                     alert_type=args.get('alert_type'),
+                                     min_severity=args.get('min_severity', SEVERITIES[0]),
+                                     fields=['id', 'last_update'],
+                                     limit=10000,
+                                     ordering='-alert_time')
+
+    for sec_event in sec_events:
+        modified_ids_to_mirror.append(f'{IncidentType.SEC_EVENT.value}:{sec_event["id"]}')
+
+    threats = get_threats(client,
+                          min_updated_timestamp=last_update_timestamp,
+                          min_severity=args.get('min_severity', SEVERITIES[0]),
+                          fields=['id'],
+                          limit=10000,
+                          ordering='-last_seen')
+
+    for threat in threats:
+        modified_ids_to_mirror.append(f'{IncidentType.THREAT.value}:{threat["id"]}')
+
+    demisto.debug(f'All ids to mirror in are: {modified_ids_to_mirror}')
+    return GetModifiedRemoteDataResponse(modified_ids_to_mirror)
+
+
+def find_incident_type(remote_incident_id: str):
+    if remote_incident_id[0:3] == IncidentType.SEC_EVENT.value:
+        return IncidentType.SEC_EVENT
+    if remote_incident_id[0:3] == IncidentType.THREAT.value:
+        return IncidentType.THREAT
+
+
+def set_updated_object(updated_object: Dict[str, Any], mirrored_data: Dict[str, Any], mirroring_fields: List[str]):
+    """
+    Sets the updated object (in place) for the security event or threat we want to mirror in, from the mirrored data, according to
+    the mirroring fields. In the mirrored data, the mirroring fields might be nested in a dict or in a dict inside a list (if so,
+    their name will have a dot in it).
+    Note that the fields that we mirror right now may have only one dot in them, so we only deal with this case.
+
+    :param updated_object: The dictionary to set its values, so it will hold the fields we want to mirror in, with their values.
+    :param mirrored_data: The data of the security event or threat we want to mirror in.
+    :param mirroring_fields: The mirroring fields that we want to mirror in, given according to whether we want to mirror a
+        security event or a threat.
+    """
+    for field in mirroring_fields:
+        if mirrored_data.get(field):
+            updated_object[field] = mirrored_data.get(field)
+
+        # if the field is not in mirrored_data, it might be a nested field - that has a . in its name
+        elif '.' in field:
+            field_name_parts = field.split('.')
+            nested_mirrored_data = mirrored_data.get(field_name_parts[0])
+
+            if isinstance(nested_mirrored_data, list):
+                # if it is a list, it should hold a dictionary in it because it is a json structure
+                for nested_field in nested_mirrored_data:
+                    if nested_field.get(field_name_parts[1]):
+                        updated_object[field] = nested_field.get(field_name_parts[1])
+                        # finding the field in the first time it is satisfying
+                        break
+            elif isinstance(nested_mirrored_data, dict):
+                if nested_mirrored_data.get(field_name_parts[1]):
+                    updated_object[field_name_parts[0]] = {}
+                    updated_object[field_name_parts[0]][field_name_parts[1]] = nested_mirrored_data.get(
+                        field_name_parts[1])
+
+
+def get_remote_secevent_data(client, remote_incident_id: str):
+    """
+    Called every time get-remote-data command runs on a security event.
+    Gets the relevant security event entity from the remote system (HarfangLab EDR). The remote system returns a list with this
+    entity in it. We take from this entity only the relevant incoming mirroring fields, in order to do the mirroring.
+    """
+    mirrored_data_list = get_security_events(
+        client, security_event_ids=[remote_incident_id])
+    mirrored_data = mirrored_data_list[0]
+
+    if 'status' in mirrored_data:
+        mirrored_data['status'] = STATUS_HFL_TO_XSOAR.get(mirrored_data.get('status'))
+
+    updated_object: Dict[str, Any] = {'incident_type': 'Hurukai alert'}
+    set_updated_object(updated_object, mirrored_data, HFL_SECURITY_EVENT_INCOMING_ARGS)
+    return mirrored_data, updated_object
+
+
+def get_remote_threat_data(client, remote_incident_id: str):
+    """
+    Called every time get-remote-data command runs on a threat.
+    Gets the relevant threat entity from the remote system (HarfangLab EDR). The remote system returns a list with this
+    entity in it. We take from this entity only the relevant incoming mirroring fields, in order to do the mirroring.
+    """
+    mirrored_data_list = get_threats(
+        client, threat_ids=[remote_incident_id])
+    mirrored_data = mirrored_data_list[0]
+
+    if 'status' in mirrored_data:
+        mirrored_data['status'] = STATUS_HFL_TO_XSOAR.get(mirrored_data.get('status'))
+
+    updated_object: Dict[str, Any] = {'incident_type': 'Hurukai threat'}
+    set_updated_object(updated_object, mirrored_data, HFL_THREAT_INCOMING_ARGS)
+    return mirrored_data, updated_object
+
+
+def close_in_xsoar(entries: List, remote_incident_id: str, incident_type_name: str):
+    demisto.debug(f'{incident_type_name} is closed: {remote_incident_id}')
+    entries.append({
+        'Type': EntryType.NOTE,
+        'Contents': {
+            'dbotIncidentClose': True,
+            'closeReason': f'{incident_type_name} was closed on HarfangLab EDR'
+        },
+        'ContentsFormat': EntryFormat.JSON
+    })
+
+
+def reopen_in_xsoar(entries: List, remote_incident_id: str, incident_type_name: str):
+    demisto.debug(f'{incident_type_name} is reopened: {remote_incident_id}')
+    entries.append({
+        'Type': EntryType.NOTE,
+        'Contents': {
+            'dbotIncidentReopen': True
+        },
+        'ContentsFormat': EntryFormat.JSON
+    })
+
+
+def set_xsoar_security_events_entries(updated_object: Dict[str, Any], entries: List, remote_incident_id: str):
+    if demisto.params().get('close_incident'):
+        if updated_object.get('status') == 'Closed':
+            close_in_xsoar(entries, remote_incident_id, 'Hurukai alert')
+        elif updated_object.get('status') in (set(STATUS_XSOAR_TO_HFL.keys()) - {'Closed'}):
+            reopen_in_xsoar(entries, remote_incident_id, 'Hurukai alert')
+
+
+def set_xsoar_threats_entries(updated_object: Dict[str, Any], entries: List, remote_incident_id: str):
+    if demisto.params().get('close_incident'):
+        if updated_object.get('status') == 'Closed':
+            close_in_xsoar(entries, remote_incident_id, 'Hurukai threat')
+        elif updated_object.get('status') in (set(STATUS_XSOAR_TO_HFL.keys()) - {'Closed'}):
+            reopen_in_xsoar(entries, remote_incident_id, 'Hurukai threat')
+
+
+def get_remote_data(client, args):
+    """
+    get-remote-data command: Returns an updated remote security event or threat.
+    Args:
+        args:
+            id: security event or threat id to retrieve.
+            lastUpdate: when was the last time we retrieved data.
+
+    Returns:
+        GetRemoteDataResponse object, which contain the security event or threat data to update.
+    """
+    remote_args = GetRemoteDataArgs(args)
+    remote_incident_id = remote_args.remote_incident_id
+
+    mirrored_data = {}
+    entries: List = []
+    updated_object = None
+
+    try:
+        demisto.debug(f'Performing get-remote-data command with incident or detection id: {remote_incident_id} '
+                      f'and last_update: {remote_args.last_update}')
+        incident_type = find_incident_type(remote_incident_id)
+        if incident_type == IncidentType.SEC_EVENT:
+            mirrored_data, updated_object = get_remote_secevent_data(client, remote_incident_id[4:])
+            if updated_object:
+                demisto.debug(f'Update security event {remote_incident_id} with fields: {updated_object}')
+                set_xsoar_security_events_entries(updated_object, entries, remote_incident_id)  # sets in place
+
+        elif incident_type == IncidentType.THREAT:
+            mirrored_data, updated_object = get_remote_threat_data(client, remote_incident_id[4:])
+            if updated_object:
+                demisto.debug(f'Update threat {remote_incident_id} with fields: {updated_object}')
+                set_xsoar_threats_entries(updated_object, entries, remote_incident_id)  # sets in place
+        else:
+            # this is here as prints can disrupt mirroring
+            raise Exception(f'Executed get-remote-data command with undefined id: {remote_incident_id}')
+
+        if not updated_object:
+            demisto.debug(f'No delta was found for detection {remote_incident_id}.')
+
+        demisto.debug(f'Updated object {updated_object}')
+
+        return GetRemoteDataResponse(mirrored_object=updated_object, entries=entries)
+
+    except Exception as e:
+        demisto.debug(f"Error in HarfangLab EDR incoming mirror for security event or threat: {remote_incident_id}\n"
+                      f"Error message: {str(e)}")
+
+        if not mirrored_data:
+            mirrored_data = {'id': remote_incident_id}
+        mirrored_data['in_mirror_error'] = str(e)
+
+        return GetRemoteDataResponse(mirrored_object=mirrored_data, entries=[])
+
+
+def close_in_hfl(delta: Dict[str, Any]) -> bool:
+    """
+    Closing in the remote system should happen only when both:
+        1. The user asked for it
+        2. One of the closing fields appears in the delta
+
+    The second is mandatory so we will not send a closing request at all of the mirroring requests that happen after closing an
+    incident (in case where the incident is updated so there is a delta, but it is not the status that was changed).
+    """
+    closing_fields = {'closeReason', 'closingUserId', 'closeNotes'}
+    return demisto.params().get('close_in_hfl') and any(field in delta for field in closing_fields)
+
+
+def update_security_event_request(client, ids: List[str], status: str) -> str:
+    if status not in SECURITY_EVENT_STATUS:
+        raise DemistoException(f'HarfangLab EDR Error: '
+                               f'Status given is {status} and it is not in {SECURITY_EVENT_STATUS}')
+
+    for eventid in ids:
+        client.change_security_event_status(eventid, status)
+    return 'OK'
+
+
+def update_threat_request(client, ids: List[str], status: str) -> str:
+    if status not in SECURITY_EVENT_STATUS:
+        raise DemistoException(f'HarfangLab EDR Error: '
+                               f'Status given is {status} and it is not in {SECURITY_EVENT_STATUS}')
+
+    for threatid in ids:
+        client.change_threat_status(threatid, status)
+    return 'OK'
+
+
+def update_remote_security_event(client, delta, inc_status: IncidentStatus, detection_id: str) -> str:
+
+    if inc_status == IncidentStatus.DONE and close_in_hfl(delta):
+        demisto.debug(f'Closing security event with remote ID {detection_id} in remote system.')
+        return str(update_security_event_request(client, [detection_id[4:]], 'closed'))
+
+    # status field in HarfangLab EDR is mapped to State field in XSOAR
+    elif inc_status == IncidentStatus.PENDING:
+        demisto.debug(
+            f'Security Event with remote ID {detection_id} status will change to "{delta.get("status")}" in remote system.')
+        return str(update_security_event_request(client, [detection_id[4:]], 'new'))
+
+    elif inc_status == IncidentStatus.ACTIVE:
+        demisto.debug(
+            f'Security Event with remote ID {detection_id} status will change to "{delta.get("status")}" in remote system.')
+        return str(update_security_event_request(client, [detection_id[4:]], 'investigating'))
+
+    return ''
+
+
+def update_remote_threat(client, delta, inc_status: IncidentStatus, detection_id: str) -> str:
+    demisto.debug(
+        f'Delta {delta}')
+
+    if 'details' in delta:
+        client.update_threat_description(detection_id[4:], delta['details'])
+
+    if inc_status == IncidentStatus.DONE and close_in_hfl(delta):
+        demisto.debug(f'Closing security event with remote ID {detection_id} in remote system.')
+        return str(update_threat_request(client, [detection_id[4:]], 'closed'))
+
+    # status field in HarfangLab EDR is mapped to State field in XSOAR
+    elif inc_status == IncidentStatus.PENDING:
+        demisto.debug(
+            f'Threat with remote ID {detection_id} status will change to "{delta.get("status")}" in remote system.')
+        return str(update_threat_request(client, [detection_id[4:]], 'new'))
+
+    elif inc_status == IncidentStatus.ACTIVE:
+        demisto.debug(
+            f'Threat with remote ID {detection_id} status will change to "{delta.get("status")}" in remote system.')
+        return str(update_threat_request(client, [detection_id[4:]], 'investigating'))
+
+    return ''
+
+
+def update_remote_system(client, args):
+    """
+    Mirrors out local changes to the remote system.
+    Args:
+        args: A dictionary containing the data regarding a modified incident, including: data, entries, incident_changed,
+         remote_incident_id, inc_status, delta
+
+    Returns:
+        The remote incident id that was modified. This is important when the incident is newly created remotely.
+    """
+    parsed_args = UpdateRemoteSystemArgs(args)
+    delta = parsed_args.delta
+    entries = parsed_args.entries
+    remote_incident_id = parsed_args.remote_incident_id
+
+    if delta:
+        demisto.debug(f'Got the following delta keys {list(delta.keys())}.')
+        demisto.debug(f'Got the following entries {entries}.')
+
+    try:
+        incident_type = find_incident_type(remote_incident_id)
+        if parsed_args.incident_changed and delta:
+            if incident_type == IncidentType.SEC_EVENT:
+                demisto.debug(f'Updating remote security event {remote_incident_id}')
+                result = update_remote_security_event(client, delta, parsed_args.inc_status, remote_incident_id)
+                if result:
+                    demisto.debug(f'Security event updated successfully. Result: {result}')
+
+            elif incident_type == IncidentType.THREAT:
+                demisto.debug(f'Updating remote threat {remote_incident_id}')
+                result = update_remote_threat(client, delta, parsed_args.inc_status, remote_incident_id)
+                if result:
+                    demisto.debug(f'Threat updated successfully. Result: {result}')
+            else:
+                raise Exception(f'Executed update-remote-system command with undefined id: {remote_incident_id}')
+
+        else:
+            pass
+            # demisto.debug(f"Skipping updating remote security event or threat {remote_incident_id} as it didn't change.")
+
+    except Exception as e:
+        demisto.error(f'Error in HarfangLab EDR outgoing mirror for security event or threat {remote_incident_id}. '
+                      f'Error message: {str(e)}')
+
+    return remote_incident_id
+
+
+def get_mapping_fields(client, args) -> GetMappingFieldsResponse:
+    """
+        Returns the list of fields to map in outgoing mirroring, for incidents and detections.
+    """
+
+    demisto.debug('In get_mapping_fields')
+    mapping_response = GetMappingFieldsResponse()
+
+    security_event_type_scheme = SchemeTypeMapping(type_name='HarfangLab EDR Security Event')
+    for argument, description in HFL_SECURITY_EVENT_OUTGOING_ARGS.items():
+        security_event_type_scheme.add_field(name=argument, description=description)
+    mapping_response.add_scheme_type(security_event_type_scheme)
+
+    threat_type_scheme = SchemeTypeMapping(type_name='HarfangLab EDR Threat')
+    for argument, description in HFL_THREAT_OUTGOING_ARGS.items():
+        threat_type_scheme.add_field(name=argument, description=description)
+    mapping_response.add_scheme_type(threat_type_scheme)
+
+    return mapping_response
 
 
 def main():
@@ -2325,7 +3282,9 @@ def main():
             args['min_severity'] = demisto.params().get(
                 'min_severity', SEVERITIES[0])
             args['max_fetch'] = demisto.params().get('max_fetch', None)
-        target_function(client, args)
+            args['mirror_direction'] = demisto.params().get('mirror_direction', None)
+            args['fetch_types'] = demisto.params().get('fetch_types', None)
+        return_results(target_function(client, args))
 
     # Log exceptions
     except Exception as e:
